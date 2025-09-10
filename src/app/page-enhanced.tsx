@@ -78,7 +78,8 @@ export default function Home() {
       startWakeWordListening();
 
       return () => {
-        voiceManager.cleanup(); // Use the new cleanup method
+        voiceManager.stopWakeWordListening();
+        voiceManager.stopActiveListening();
       };
     }
   }, []);
@@ -111,7 +112,6 @@ export default function Home() {
     if (voiceManagerRef.current && !isVoiceTaskCreatorOpen) {
       setIsWaitingForWakeWord(true);
       setVoiceStatus("Say 'Hi Voice' to activate");
-      voiceManagerRef.current.resetRetryCount(); // Reset retry count before starting
       voiceManagerRef.current.startWakeWordListening();
     }
   };
