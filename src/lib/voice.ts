@@ -1,6 +1,9 @@
+// src/lib/voice.ts
+// ------------------------------------------------------
 // Voice Recognition and Speech Synthesis Utilities
+// TypeScript-safe & stable version
+// ------------------------------------------------------
 
-// Define voice command categories
 export const voiceCommands = {
   createTask: ["create task", "add task", "new task", "make task"],
   completeTask: ["complete", "finish", "done", "mark complete"],
@@ -36,16 +39,32 @@ export class VoiceManager {
   private retryTimeoutId?: number;
   private retryCount = 0;
   private maxRetries = 3;
+  private isRecognizing = false;
+  private debug = true; // Enable debug logging
+  private hasShownSecurityAlert = false;
+  private permanentlyDisabled = false;
 
   constructor() {
     this.synthesis = window.speechSynthesis;
 
-    // Check if speech recognition is available
     if (this.isSpeechRecognitionSupported()) {
       this.initializeRecognition();
+      console.log(
+        "%c🎤 Voice Manager Initialized",
+        "color: #10b981; font-weight: bold; font-size: 14px;",
+        "\n✅ Speech recognition is supported in this browser" +
+          "\n📍 Running on:",
+        location.href +
+          "\n💡 Say 'Hi Voice' to activate voice commands" +
+          "\n\n⚠️ Note: Requires internet connection to reach Google Speech API"
+      );
     } else {
       console.warn("Speech recognition is not supported in this browser");
     }
+  }
+
+  private log(msg: string) {
+    if (this.debug) console.log(`[VoiceManager] ${msg}`);
   }
 
   private isSpeechRecognitionSupported(): boolean {
@@ -53,233 +72,336 @@ export class VoiceManager {
   }
 
   private initializeRecognition() {
-    if (
-      !("webkitSpeechRecognition" in window) &&
-      !("SpeechRecognition" in window)
-    ) {
+    const SpeechRecognitionConstructor =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionConstructor) {
       console.error("Speech recognition not supported in this browser");
       return;
     }
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-    this.recognition = new SpeechRecognition();
+    this.recognition = new SpeechRecognitionConstructor() as SpeechRecognition;
+    this.recognition.continuous = true;
+    this.recognition.interimResults = true;
+    this.recognition.lang = "en-US";
 
-    this.recognition!.continuous = true;
-    this.recognition!.interimResults = true;
-    this.recognition!.lang = "en-US";
+    // ------------------------
+    // Recognition Handlers
+    // ------------------------
 
     this.recognition!.onstart = () => {
+      this.isRecognizing = true;
       this.isListening = true;
+      // Don't reset retry count here - it should only be reset on successful recognition
+      // or when explicitly starting wake word listening for the first time
+      console.log("🎤 Recognition started - microphone is active");
+      if (this.isWaitingForWakeWord) {
+        console.log(`👂 Listening for wake word: "${this.wakeWord}"`);
+      }
       this.onListeningStateChange?.(true);
-      // Reset retry count on successful start
-      this.retryCount = 0;
+    };
+
+    this.recognition!.onaudiostart = () => {
+      console.log("🔊 Audio input detected - microphone is receiving sound");
+    };
+
+    this.recognition!.onsoundstart = () => {
+      console.log("📢 Sound detected - processing audio...");
+    };
+
+    this.recognition!.onspeechstart = () => {
+      console.log("🗣️ Speech detected - recognizing words...");
+    };
+
+    this.recognition!.onspeechend = () => {
+      console.log("🔇 Speech ended");
     };
 
     this.recognition!.onend = () => {
+      this.isRecognizing = false;
       this.isListening = false;
+      this.log("Recognition ended");
       this.onListeningStateChange?.(false);
 
-      // Only restart if we're still waiting for wake word and haven't exceeded retries
-      if (this.isWaitingForWakeWord && this.retryCount < this.maxRetries) {
+      // Only restart if waiting for wake word, not permanently disabled, and haven't exceeded retries
+      if (
+        this.isWaitingForWakeWord &&
+        !this.permanentlyDisabled &&
+        this.retryCount < this.maxRetries
+      ) {
         this.retryTimeoutId = window.setTimeout(() => {
-          if (this.isWaitingForWakeWord && !this.isListening) {
-            this.startWakeWordListening();
+          if (
+            this.isWaitingForWakeWord &&
+            !this.isRecognizing &&
+            !this.permanentlyDisabled
+          ) {
+            this.safeStart();
           }
-        }, 1000);
+        }, 1500);
       }
     };
-    this.recognition!.onresult = (event: any) => {
-      const lastResult = event.results[event.results.length - 1];
 
+    this.recognition!.onresult = (event: SpeechRecognitionEvent) => {
+      const lastResult = event.results[event.results.length - 1];
       if (lastResult.isFinal) {
         const transcript = lastResult[0].transcript.toLowerCase().trim();
+        const confidence = lastResult[0].confidence;
+        console.log(
+          `🎤 Heard: "${transcript}" (confidence: ${(confidence * 100).toFixed(
+            1
+          )}%)`
+        );
+
+        // Reset retry count on successful speech recognition
+        this.retryCount = 0;
 
         if (this.isWaitingForWakeWord) {
+          console.log(
+            `🔍 Checking for wake word "${this.wakeWord}" in: "${transcript}"`
+          );
           if (transcript.includes(this.wakeWord)) {
+            console.log("✅ Wake word detected!");
             this.handleWakeWordDetected();
+          } else {
+            console.log(
+              `❌ Wake word not found. Try saying "${this.wakeWord}"`
+            );
           }
         } else {
           this.onSpeechResult?.(transcript);
         }
       }
     };
-
     this.recognition!.onerror = (event: any) => {
       console.error("Speech recognition error:", event.error);
 
-      // Clear any existing retry timeout
       if (this.retryTimeoutId) {
-        window.clearTimeout(this.retryTimeoutId);
+        clearTimeout(this.retryTimeoutId);
         this.retryTimeoutId = undefined;
       }
 
-      // Handle different types of errors
       switch (event.error) {
         case "network":
+          const isLocalhost =
+            location.hostname === "localhost" ||
+            location.hostname === "127.0.0.1" ||
+            location.hostname === "";
+          const isHttps = location.protocol === "https:";
+
+          if (!isHttps && !isLocalhost) {
+            console.error(
+              "❌ SpeechRecognition requires HTTPS or localhost. Current origin is not secure."
+            );
+            console.error(
+              "Please access the app via https:// or localhost to use voice features."
+            );
+            this.isWaitingForWakeWord = false;
+            this.permanentlyDisabled = true;
+
+            if (!this.hasShownSecurityAlert) {
+              this.hasShownSecurityAlert = true;
+              alert(
+                "Voice recognition requires HTTPS or localhost.\n\n" +
+                  "Please access the app via:\n" +
+                  "• https://your-domain.com\n" +
+                  "• http://localhost:3000\n\n" +
+                  "Voice features are disabled on insecure origins."
+              );
+            }
+            break;
+          }
+
+          // If we're on localhost/https but still getting network errors, it might be a real network issue
           if (this.retryCount < this.maxRetries) {
             this.retryCount++;
             console.warn(
               `Network error in speech recognition. Retry ${this.retryCount}/${this.maxRetries} in 3 seconds...`
             );
             this.retryTimeoutId = window.setTimeout(() => {
-              if (this.isWaitingForWakeWord && !this.isListening) {
-                this.startWakeWordListening();
+              if (this.isWaitingForWakeWord && !this.isRecognizing) {
+                this.safeStart();
               }
             }, 3000);
           } else {
+            console.error("Max retries reached. Stopping speech recognition.");
             console.error(
-              "Max retries reached for speech recognition network errors. Stopping retries."
+              "💡 Tip: Make sure you've granted microphone permissions in your browser.\n" +
+                "Go to: chrome://settings/content/siteDetails?site=http://localhost:3000"
             );
             this.isWaitingForWakeWord = false;
+            this.permanentlyDisabled = true;
+            this.onListeningStateChange?.(false);
+
+            if (!this.hasShownSecurityAlert) {
+              this.hasShownSecurityAlert = true;
+              alert(
+                "⚠️ Unable to connect to speech recognition service\n\n" +
+                  "Possible causes:\n" +
+                  "• Microphone permissions not granted\n" +
+                  "• Microphone is being used by another app\n" +
+                  "• Browser doesn't have microphone access\n" +
+                  "• Firewall/antivirus blocking the connection\n\n" +
+                  "Troubleshooting:\n" +
+                  "1. Click the 🔒 or ℹ️ icon in the address bar\n" +
+                  "2. Ensure microphone is set to 'Allow'\n" +
+                  "3. Close other apps using your microphone\n" +
+                  "4. Refresh the page and try again\n\n" +
+                  "Voice features will be disabled until the page is refreshed."
+              );
+            }
           }
           break;
 
         case "not-allowed":
-          console.error(
+          alert(
             "Microphone access denied. Please allow microphone access and refresh."
           );
           this.isWaitingForWakeWord = false;
+          this.onListeningStateChange?.(false);
           break;
 
         case "no-speech":
+          console.warn(
+            "⚠️ No speech detected. Make sure:\n" +
+              "  • Your microphone is working and not muted\n" +
+              "  • You're speaking clearly and loud enough\n" +
+              "  • The correct microphone is selected in browser settings\n" +
+              "  • No other app is using the microphone"
+          );
           if (this.isWaitingForWakeWord && this.retryCount < this.maxRetries) {
-            // Continue listening for wake word after a brief pause
             this.retryTimeoutId = window.setTimeout(() => {
-              if (!this.isListening) {
-                this.startWakeWordListening();
-              }
+              if (!this.isRecognizing) this.safeStart();
             }, 1000);
           }
           break;
 
-        case "audio-capture":
-          console.error("Audio capture error. Check your microphone.");
-          break;
-
         case "aborted":
-          // Recognition was aborted, this is usually intentional
-          console.log("Speech recognition aborted");
+          this.log("Speech recognition aborted intentionally.");
           break;
 
         default:
-          console.error("Unknown speech recognition error:", event.error);
-          // Try to restart after a delay for unknown errors
-          setTimeout(() => {
-            if (this.isWaitingForWakeWord) {
-              this.startWakeWordListening();
-            }
-          }, 2000);
+          console.warn("Unknown speech recognition error:", event.error);
+          if (this.isWaitingForWakeWord && this.retryCount < this.maxRetries) {
+            this.retryCount++;
+            setTimeout(() => {
+              if (!this.isRecognizing) this.safeStart();
+            }, 2000);
+          } else if (this.retryCount >= this.maxRetries) {
+            console.error("Max retries reached for unknown error. Stopping.");
+            this.isWaitingForWakeWord = false;
+            this.onListeningStateChange?.(false);
+          }
           break;
       }
     };
   }
 
-  public startWakeWordListening() {
-    if (!this.recognition || this.isListening) {
-      if (!this.recognition) {
-        console.warn("Speech recognition not available");
-      } else {
-        console.log("Speech recognition already listening");
-      }
+  // ------------------------
+  // Safe Start/Stop
+  // ------------------------
+
+  private safeStart() {
+    // Don't start if permanently disabled
+    if (this.permanentlyDisabled) {
+      console.warn(
+        "Voice recognition is permanently disabled due to security requirements"
+      );
+      return;
+    }
+
+    if (!this.recognition || this.isRecognizing) {
+      if (!this.recognition) console.warn("Speech recognition unavailable");
       return;
     }
 
     try {
-      this.isWaitingForWakeWord = true;
-      this.retryCount = 0; // Reset retry count on new start
-      this.recognition.start();
+      this.recognition!.start();
+      this.isRecognizing = true;
+      this.log("Recognition started safely");
     } catch (error: any) {
-      console.error("Error starting speech recognition:", error.message);
-      if (
-        error.name === "InvalidStateError" &&
-        error.message.includes("already started")
-      ) {
-        // Recognition is already running, just update our state
-        console.log("Speech recognition was already running, syncing state");
-        this.isListening = true;
-        this.isWaitingForWakeWord = true;
+      if (error.name === "InvalidStateError") {
+        this.log("Recognition already running — syncing state");
+        this.isRecognizing = true;
+      } else {
+        console.error("Error starting speech recognition:", error.message);
       }
     }
   }
 
-  public stopWakeWordListening() {
-    this.isWaitingForWakeWord = false;
-
-    // Clear any pending retries
-    if (this.retryTimeoutId) {
-      window.clearTimeout(this.retryTimeoutId);
-      this.retryTimeoutId = undefined;
-    }
-
-    if (this.recognition && this.isListening) {
+  private safeStop() {
+    if (this.recognition && this.isRecognizing) {
       try {
-        this.recognition.stop();
+        this.recognition!.stop();
+        this.isRecognizing = false;
+        this.log("Recognition stopped safely");
       } catch (error) {
-        console.error("Error stopping speech recognition:", error);
+        console.error("Error stopping recognition:", error);
       }
     }
+  }
+
+  // ------------------------
+  // Public API
+  // ------------------------
+
+  public startWakeWordListening() {
+    this.isWaitingForWakeWord = true;
+    // Only reset retry count if not already listening
+    if (!this.isRecognizing) {
+      this.retryCount = 0;
+    }
+    this.safeStart();
+  }
+
+  public stopWakeWordListening() {
+    this.isWaitingForWakeWord = false;
+    if (this.retryTimeoutId) {
+      clearTimeout(this.retryTimeoutId);
+      this.retryTimeoutId = undefined;
+    }
+    this.safeStop();
+  }
+
+  public startActiveListening() {
+    this.isWaitingForWakeWord = false;
+    this.safeStart();
+  }
+
+  public stopActiveListening() {
+    this.safeStop();
   }
 
   public resetRetryCount() {
     this.retryCount = 0;
     if (this.retryTimeoutId) {
-      window.clearTimeout(this.retryTimeoutId);
+      clearTimeout(this.retryTimeoutId);
       this.retryTimeoutId = undefined;
-    }
-  }
-
-  public startActiveListening() {
-    if (!this.recognition || this.isListening) {
-      if (!this.recognition) {
-        console.warn("Speech recognition not available");
-      }
-      return;
-    }
-
-    try {
-      this.isWaitingForWakeWord = false;
-      this.recognition.start();
-    } catch (error) {
-      console.error("Error starting active listening:", error);
-    }
-  }
-
-  public stopActiveListening() {
-    if (this.recognition && this.isListening) {
-      try {
-        this.recognition.stop();
-      } catch (error) {
-        console.error("Error stopping active listening:", error);
-      }
     }
   }
 
   private handleWakeWordDetected() {
     this.isWaitingForWakeWord = false;
-    this.resetRetryCount(); // Reset retry count on successful wake word detection
+    this.resetRetryCount();
     this.onWakeWordDetected?.();
     this.speak("Hello! I'm listening. How can I help you with your tasks?");
   }
 
   public speak(text: string, callback?: () => void) {
     if (!this.synthesis) return;
-
-    // Cancel any ongoing speech
     this.synthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 0.9;
     utterance.pitch = 1;
     utterance.volume = 0.8;
-
-    utterance.onend = () => {
-      callback?.();
-    };
-
+    utterance.onend = () => callback?.();
     this.synthesis.speak(utterance);
   }
+
+  // ------------------------
+  // Event Bindings
+  // ------------------------
 
   public onWakeWord(callback: () => void) {
     this.onWakeWordDetected = callback;
@@ -301,6 +423,14 @@ export class VoiceManager {
     return this.isWaitingForWakeWord;
   }
 
+  public isDisabled() {
+    return this.permanentlyDisabled;
+  }
+
+  public isSupported() {
+    return this.recognition !== null;
+  }
+
   public cleanup() {
     this.stopWakeWordListening();
     this.stopActiveListening();
@@ -308,7 +438,10 @@ export class VoiceManager {
   }
 }
 
-// Task creation questions flow
+// ------------------------------------------------------
+// Task Question Flow
+// ------------------------------------------------------
+
 export const taskQuestions: TaskQuestion[] = [
   {
     id: "title",
@@ -316,7 +449,7 @@ export const taskQuestions: TaskQuestion[] = [
     field: "title",
     type: "text",
     validation: (value) => value.trim().length > 0,
-    followUp: "Got it! ",
+    followUp: "Got it!",
   },
   {
     id: "description",
@@ -324,7 +457,7 @@ export const taskQuestions: TaskQuestion[] = [
       "Would you like to add a description? You can say 'skip' to continue.",
     field: "description",
     type: "text",
-    followUp: "Description noted. ",
+    followUp: "Description noted.",
   },
   {
     id: "priority",
@@ -334,7 +467,7 @@ export const taskQuestions: TaskQuestion[] = [
     options: ["high", "medium", "low"],
     validation: (value) =>
       ["high", "medium", "low"].includes(value.toLowerCase()),
-    followUp: "Priority set to ",
+    followUp: "Priority set.",
   },
   {
     id: "category",
@@ -342,7 +475,7 @@ export const taskQuestions: TaskQuestion[] = [
       "What category is this task? For example: work, personal, shopping, or say 'skip'.",
     field: "category",
     type: "text",
-    followUp: "Category added. ",
+    followUp: "Category added.",
   },
   {
     id: "dueDate",
@@ -350,38 +483,34 @@ export const taskQuestions: TaskQuestion[] = [
       "When is this due? You can say things like 'today', 'tomorrow', 'next Friday', or 'skip'.",
     field: "dueDate",
     type: "date",
-    followUp: "Due date set. ",
+    followUp: "Due date set.",
   },
 ];
 
-// Date parsing utility
+// ------------------------------------------------------
+// Date Parsing Utility
+// ------------------------------------------------------
+
 export function parseDateFromSpeech(speech: string): string {
   const text = speech.toLowerCase();
   const today = new Date();
 
-  if (text.includes("today")) {
-    return today.toISOString().split("T")[0];
-  }
-
+  if (text.includes("today")) return today.toISOString().split("T")[0];
   if (text.includes("tomorrow")) {
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    return tomorrow.toISOString().split("T")[0];
+    const d = new Date(today);
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().split("T")[0];
   }
-
   if (text.includes("next week")) {
-    const nextWeek = new Date(today);
-    nextWeek.setDate(nextWeek.getDate() + 7);
-    return nextWeek.toISOString().split("T")[0];
+    const d = new Date(today);
+    d.setDate(d.getDate() + 7);
+    return d.toISOString().split("T")[0];
   }
-
   if (text.includes("monday")) {
-    const nextMonday = new Date(today);
-    const daysUntilMonday = (1 + 7 - today.getDay()) % 7 || 7;
-    nextMonday.setDate(today.getDate() + daysUntilMonday);
-    return nextMonday.toISOString().split("T")[0];
+    const d = new Date(today);
+    const diff = (1 + 7 - today.getDay()) % 7 || 7;
+    d.setDate(today.getDate() + diff);
+    return d.toISOString().split("T")[0];
   }
-
-  // Add more date parsing logic as needed
   return "";
 }
